@@ -1,0 +1,174 @@
+---
+title: "Movie Recommendation"
+author: "Jasper Linke"
+date: "6/17/2019"
+output: pdf_document
+---
+
+## Introduction
+
+This project uses a linear regression machine learning algorithm to predict movie ratings. The final algorithm bases its prediction on user and movie averages in ratings.
+
+The data set is based on an actual Netflix coding challenge to improve the movie recommendation algorithm of the company. The present data set was prepared for download by HavardX. The data and code can be downloaded from this Git hub repository: https://github.com/jprlink/movie-recom.git
+
+This brief report will outline the methods and steps of analysis and will conclude by discussing the findings.
+
+## Methods and Analysis
+
+The following packages are needed for the analysis:
+```{r libraries}
+library(tidyverse)
+library(caret)
+```
+
+The test ("validation") and training ("edx") data is loaded. As the training set is too large to be uploaded to Git hub, please download it from edx and change the file reference according to your file system if you want to run the code.
+
+```{r loading data, echo=FALSE}
+edx <- readRDS("~/Documents/Data science course/movielens_data/edx.rds")
+validation <- readRDS("~/Documents/Data science course/movielens_data/validation.rds")
+```
+
+Before further analysis, the data was checked for missing values. There are none.
+
+The training set includes 999,999 rows and six variables: user IDs, movie IDs, time stamps, movie titles and genres. Movies are most commonly rated a 4, followed by a 3 and a 5. The data set includes 10,677 movies and 69878 Netflix users. Pulp Fiction and Forest Gump are the most frequently rated movies, while The Shawshank Redemption and The Godfather are, on average, the most highly rated movies (taking only into account movies with at least 100 ratings).
+
+```{r data exploration, echo=FALSE}
+str(edx)
+head(edx) %>% knitr::kable()
+
+edx %>% count(rating) %>% arrange(desc(n)) %>% knitr::kable()
+
+edx_movieId_unique <- unique(edx$movieId)
+length(edx_movieId_unique)
+
+edx_users_unique <- unique(edx$userId)
+length(edx_users_unique)
+
+movie_ratings <- edx %>% group_by(title) %>% summarize(n_rating = length(rating))
+movie_ratings %>% arrange(desc(n_rating)) %>% head() %>% knitr::kable() 
+
+movie_rating <- edx %>% group_by(title) %>% filter(n() >= 100) %>% summarize(avg_rating = mean(rating)) 
+movie_rating %>% arrange(desc(avg_rating)) %>% head() %>% knitr::kable()
+```
+
+A first "naive" model is built based on the mean rating. It therefore assumes the same rating for all movies 
+and users, while all differences are explained by random variation. The model predicts movie ratings with a Residual Mean Square Error (RMSE) of 1.06.
+
+```{r first model}
+mu_hat <- mean(edx$rating)
+
+naive_rmse <- RMSE(edx$rating, mu_hat)
+
+rmse_results <- tibble(method = "Just the average", RMSE = naive_rmse)
+```
+
+A second model takes into account that some movies are just generally rated higher than others. Producing an RMSE of 0.942, the model performs better than the "naive" average-based model.
+```{r second model}
+mu <- mean(edx$rating)
+movie_avgs <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - mu))
+movie_avgs %>% qplot(b_i, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- mu + edx %>%
+  left_join(movie_avgs, by='movieId') %>%
+  pull(b_i)
+
+model_1_rmse <- RMSE(predicted_ratings, edx$rating)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Movie Effect Model",
+                                     RMSE = model_1_rmse))
+rmse_results %>% knitr::kable()
+```
+
+A third model takes into account variation in rating behavior across different users. Adding this "user effect" further reduces the RMSE to 0.857.
+```{r third model}
+edx %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating)) %>%
+  filter(n()>=100) %>%
+  ggplot(aes(b_u)) +
+  geom_histogram(bins = 30, color = "black")
+
+user_avgs <- edx %>%
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- edx %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+model_2_rmse <- RMSE(predicted_ratings, edx$rating)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Movie + User Effects Model",
+                                     RMSE = model_2_rmse))
+rmse_results %>% knitr::kable()
+```
+
+Another model that integrates a time effect (week-based) does not considerable improve the prediction. A model measuring a genre effect was unfortunately not possible due to the strong computing power required.
+
+Hence, the movie and user effect model was further refined using regularization. This tuning process defines penalty parameter lambda that reduces the effect of movies and users with only a small a number of observations.
+```{r regularization}
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(edx$rating)
+  b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  b_u <- edx %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  predicted_ratings <-
+    edx %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  return(RMSE(predicted_ratings, edx$rating))
+})
+
+qplot(lambdas, rmses)
+
+lambda <- lambdas[which.min(rmses)]
+
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Regularized Movie + User Effect Model",
+                                     RMSE = min(rmses)))
+rmse_results %>% knitr::kable()
+```
+
+The regularization process only slightly reduces the RMSE further to 0.856. The reason for the small effect might be that the overall sample size is already very large.
+
+The final model is now evaluated based on the test data. The RMSE is only slightly higher than in the previous models based on the training data.
+
+```{r testing}
+mu <- mean(edx$rating)
+b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+lambda))
+b_u <- edx %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+lambda))
+predicted_ratings <-
+    validation %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  
+rmse_final <- RMSE(predicted_ratings, validation$rating)
+rmse_final
+```
+
+## Discussion of results
+The modelling process shows that knowing the average rating per movie and user already significantly improves the prediction accuracy compared to a simple mean-based model. The algorithm can be used to provide recommendations to Netflix user on the movies that might correspond to their preferences. 
+
+These results should, however, be treated with caution, because users who like or do not like a movie will not necessarily rate it. In this project, "rating predicts rating" - nothing more and nothing less: This does not mean that rating predicts users' actual perception of a movie. 
+
+## Conclusion
+Using a linear regression machine learning algorithm, this small project could significantly improve the accuracy of predicting movie ratings, compared to a simple average-based model. Taking into account other factors such as movie genre, user's location and age might further improve accuracy.
